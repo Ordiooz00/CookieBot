@@ -68,6 +68,12 @@ def parse_args() -> argparse.Namespace:
         help="Delay (seconds) after completing a full sequence loop. Default: 2.0",
     )
     parser.add_argument(
+        "--fallback-timeout",
+        type=float,
+        default=2.0,
+        help="Time (seconds) to wait for next template before falling back to previous. Default: 2.0",
+    )
+    parser.add_argument(
         "--region",
         nargs=4,
         type=int,
@@ -180,6 +186,18 @@ def compute_click_point(top_left, template_shape, region):
     return x, y
 
 
+def do_click(x: int, y: int) -> None:
+    """Perform an instant click at (x, y) using Windows API to prevent mouse movement interference."""
+    try:
+        import ctypes
+        # Set cursor position and click instantly without PyAutoGUI pause delays
+        ctypes.windll.user32.SetCursorPos(int(x), int(y))
+        ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
+        ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
+    except Exception:
+        pyautogui.click(x, y)
+
+
 def main() -> None:
     args = parse_args()
 
@@ -203,6 +221,8 @@ def main() -> None:
     last_click_ts = 0.0
     use_sequence_mode = args.numbered is not None
     sequence_index = 0
+    is_fallback = False
+    search_start_ts = time.time()
 
     while True:
         stop_requested, reset_requested = handle_keyboard_input(templates)
@@ -211,6 +231,8 @@ def main() -> None:
             break
         if reset_requested:
             sequence_index = 0
+            is_fallback = False
+            search_start_ts = time.time()
 
         frame = screenshot_to_cv(args.region, args.grayscale)
 
@@ -219,7 +241,8 @@ def main() -> None:
         matched = False
 
         if use_sequence_mode:
-            templates_to_check = [templates[sequence_index]]
+            check_index = (sequence_index - 1) % len(templates) if is_fallback else sequence_index
+            templates_to_check = [templates[check_index]]
         else:
             templates_to_check = templates
 
@@ -240,16 +263,22 @@ def main() -> None:
                     wait_left = args.cooldown - seconds_since_last_click
                     print(f"[{now()}] Cooldown active ({wait_left:.2f}s left)")
                 elif not args.dry_run:
-                    pyautogui.click(click_x, click_y)
+                    do_click(click_x, click_y)
                     last_click_ts = time.time()
                     print(f"[{now()}] Clicked {tpl_name}")
                     if use_sequence_mode:
-                        sequence_index = (sequence_index + 1) % len(templates)
-                        if sequence_index == 0:
-                            print(f"[{now()}] Loop completed! Waiting {args.loop_delay:.1f}s before restarting...")
-                            time.sleep(args.loop_delay)
-                        next_name = templates[sequence_index][0]
-                        print(f"[{now()}] Next template: {next_name}")
+                        if is_fallback:
+                            is_fallback = False
+                            next_name = templates[sequence_index][0]
+                            print(f"[{now()}] Fallback click succeeded! Returning to target template: {next_name}")
+                        else:
+                            sequence_index = (sequence_index + 1) % len(templates)
+                            if sequence_index == 0:
+                                print(f"[{now()}] Loop completed! Waiting {args.loop_delay:.1f}s before restarting...")
+                                time.sleep(args.loop_delay)
+                            next_name = templates[sequence_index][0]
+                            print(f"[{now()}] Next template: {next_name}")
+                        search_start_ts = time.time()
 
                 matched = True
                 if args.once:
@@ -258,8 +287,28 @@ def main() -> None:
 
         if not matched:
             if use_sequence_mode:
-                current_name = templates[sequence_index][0]
-                print(f"[{now()}] Waiting for {current_name} (best={best_name}:{best_score:.3f})")
+                current_name = templates[check_index][0]
+                status_str = f"Fallback: searching {current_name}" if is_fallback else f"Waiting for {current_name}"
+                print(f"[{now()}] {status_str} (best={best_name}:{best_score:.3f})")
+
+                if time.time() - search_start_ts >= args.fallback_timeout:
+                    if not is_fallback:
+                        is_fallback = True
+                        search_start_ts = time.time()
+                        prev_index = (sequence_index - 1) % len(templates)
+                        prev_name = templates[prev_index][0]
+                        print(
+                            f"[{now()}] Timeout waiting for {templates[sequence_index][0]} "
+                            f"({args.fallback_timeout:.1f}s). Falling back to previous: {prev_name}"
+                        )
+                    else:
+                        is_fallback = False
+                        search_start_ts = time.time()
+                        target_name = templates[sequence_index][0]
+                        print(
+                            f"[{now()}] Fallback timeout ({args.fallback_timeout:.1f}s). "
+                            f"Returning to main target: {target_name}"
+                        )
             else:
                 print(f"[{now()}] No match (best={best_name}:{best_score:.3f})")
             if args.once:
