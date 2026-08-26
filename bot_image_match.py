@@ -1,5 +1,6 @@
 import argparse
 import datetime as dt
+import random
 import time
 from pathlib import Path
 from typing import List, Tuple
@@ -51,27 +52,31 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--interval",
+        nargs="+",
         type=float,
-        default=0.7,
-        help="Delay (seconds) between scans. Default: 0.7",
+        default=[0.5, 0.9],
+        help="Delay (seconds) between scans. Single value or MIN MAX range. Default: 0.5 0.9",
     )
     parser.add_argument(
         "--cooldown",
+        nargs="+",
         type=float,
-        default=1.2,
-        help="Minimum delay (seconds) between clicks. Default: 1.2",
+        default=[1.0, 1.6],
+        help="Minimum delay (seconds) between clicks. Single value or MIN MAX range. Default: 1.0 1.6",
     )
     parser.add_argument(
         "--loop-delay",
+        nargs="+",
         type=float,
-        default=2.0,
-        help="Delay (seconds) after completing a full sequence loop. Default: 2.0",
+        default=[2.0, 6.0],
+        help="Delay (seconds) after completing a full loop. Single value or MIN MAX range. Default: 2.0 6.0",
     )
     parser.add_argument(
         "--fallback-timeout",
+        nargs="+",
         type=float,
-        default=2.0,
-        help="Time (seconds) to wait for next template before falling back to previous. Default: 2.0",
+        default=[1.8, 2.5],
+        help="Time (seconds) to wait before falling back. Single value or MIN MAX range. Default: 1.8 2.5",
     )
     parser.add_argument(
         "--region",
@@ -176,10 +181,24 @@ def find_template(frame: np.ndarray, template: np.ndarray):
     return max_val, max_loc
 
 
+def get_random_value(values) -> float:
+    """Return a random float between min and max if a list is provided, otherwise return float value."""
+    if isinstance(values, (int, float)):
+        return float(values)
+    if not values:
+        return 0.0
+    if len(values) == 1:
+        return float(values[0])
+    return random.uniform(min(values), max(values))
+
+
 def compute_click_point(top_left, template_shape, region):
     tpl_h, tpl_w = template_shape[:2]
-    x = top_left[0] + tpl_w // 2
-    y = top_left[1] + tpl_h // 2
+    # Add slight random coordinate jitter (±2px) to prevent clicking the exact same pixel
+    jitter_x = random.randint(-2, 2)
+    jitter_y = random.randint(-2, 2)
+    x = top_left[0] + tpl_w // 2 + jitter_x
+    y = top_left[1] + tpl_h // 2 + jitter_y
     if region:
         x += region[0]
         y += region[1]
@@ -187,10 +206,9 @@ def compute_click_point(top_left, template_shape, region):
 
 
 def do_click(x: int, y: int) -> None:
-    """Perform an instant click at (x, y) using Windows API to prevent mouse movement interference."""
+    """Move cursor to (x, y) and click immediately without delay."""
     try:
         import ctypes
-        # Set cursor position and click instantly without PyAutoGUI pause delays
         ctypes.windll.user32.SetCursorPos(int(x), int(y))
         ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
         ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
@@ -223,6 +241,8 @@ def main() -> None:
     sequence_index = 0
     is_fallback = False
     search_start_ts = time.time()
+    current_cooldown = get_random_value(args.cooldown)
+    current_fallback_timeout = get_random_value(args.fallback_timeout)
 
     while True:
         stop_requested, reset_requested = handle_keyboard_input(templates)
@@ -233,6 +253,7 @@ def main() -> None:
             sequence_index = 0
             is_fallback = False
             search_start_ts = time.time()
+            current_fallback_timeout = get_random_value(args.fallback_timeout)
 
         frame = screenshot_to_cv(args.region, args.grayscale)
 
@@ -259,12 +280,13 @@ def main() -> None:
                 )
 
                 seconds_since_last_click = time.time() - last_click_ts
-                if seconds_since_last_click < args.cooldown:
-                    wait_left = args.cooldown - seconds_since_last_click
+                if seconds_since_last_click < current_cooldown:
+                    wait_left = current_cooldown - seconds_since_last_click
                     print(f"[{now()}] Cooldown active ({wait_left:.2f}s left)")
                 elif not args.dry_run:
                     do_click(click_x, click_y)
                     last_click_ts = time.time()
+                    current_cooldown = get_random_value(args.cooldown)
                     print(f"[{now()}] Clicked {tpl_name}")
                     if use_sequence_mode:
                         if is_fallback:
@@ -274,11 +296,13 @@ def main() -> None:
                         else:
                             sequence_index = (sequence_index + 1) % len(templates)
                             if sequence_index == 0:
-                                print(f"[{now()}] Loop completed! Waiting {args.loop_delay:.1f}s before restarting...")
-                                time.sleep(args.loop_delay)
+                                delay = get_random_value(args.loop_delay)
+                                print(f"[{now()}] Loop completed! Waiting {delay:.2f}s before restarting...")
+                                time.sleep(delay)
                             next_name = templates[sequence_index][0]
                             print(f"[{now()}] Next template: {next_name}")
                         search_start_ts = time.time()
+                        current_fallback_timeout = get_random_value(args.fallback_timeout)
 
                 matched = True
                 if args.once:
@@ -291,22 +315,24 @@ def main() -> None:
                 status_str = f"Fallback: searching {current_name}" if is_fallback else f"Waiting for {current_name}"
                 print(f"[{now()}] {status_str} (best={best_name}:{best_score:.3f})")
 
-                if time.time() - search_start_ts >= args.fallback_timeout:
+                if time.time() - search_start_ts >= current_fallback_timeout:
                     if not is_fallback:
                         is_fallback = True
                         search_start_ts = time.time()
+                        current_fallback_timeout = get_random_value(args.fallback_timeout)
                         prev_index = (sequence_index - 1) % len(templates)
                         prev_name = templates[prev_index][0]
                         print(
                             f"[{now()}] Timeout waiting for {templates[sequence_index][0]} "
-                            f"({args.fallback_timeout:.1f}s). Falling back to previous: {prev_name}"
+                            f"({current_fallback_timeout:.1f}s). Falling back to previous: {prev_name}"
                         )
                     else:
                         is_fallback = False
                         search_start_ts = time.time()
+                        current_fallback_timeout = get_random_value(args.fallback_timeout)
                         target_name = templates[sequence_index][0]
                         print(
-                            f"[{now()}] Fallback timeout ({args.fallback_timeout:.1f}s). "
+                            f"[{now()}] Fallback timeout ({current_fallback_timeout:.1f}s). "
                             f"Returning to main target: {target_name}"
                         )
             else:
@@ -314,7 +340,7 @@ def main() -> None:
             if args.once:
                 break
 
-        time.sleep(args.interval)
+        time.sleep(get_random_value(args.interval))
 
 
 if __name__ == "__main__":
