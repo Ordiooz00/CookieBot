@@ -62,6 +62,12 @@ def parse_args() -> argparse.Namespace:
         help="Minimum delay (seconds) between clicks. Default: 1.2",
     )
     parser.add_argument(
+        "--loop-delay",
+        type=float,
+        default=2.0,
+        help="Delay (seconds) after completing a full sequence loop. Default: 2.0",
+    )
+    parser.add_argument(
         "--region",
         nargs=4,
         type=int,
@@ -90,11 +96,19 @@ def now() -> str:
     return dt.datetime.now().strftime("%H:%M:%S")
 
 
-def maybe_quit() -> bool:
-    if not msvcrt.kbhit():
-        return False
-    key = msvcrt.getwch()
-    return key.lower() == "q"
+def handle_keyboard_input(templates: List[Tuple[str, np.ndarray]]) -> Tuple[bool, bool]:
+    """Check keyboard input for controls: 'q' to quit, 'r' to reset sequence to template 1."""
+    stop_requested = False
+    reset_requested = False
+    while msvcrt.kbhit():
+        key = msvcrt.getwch().lower()
+        if key == "q":
+            stop_requested = True
+        elif key == "r":
+            reset_requested = True
+            first_name = templates[0][0]
+            print(f"[{now()}] Restart requested (r pressed): sequence reset to 1 ({first_name})")
+    return stop_requested, reset_requested
 
 
 def load_template(template_path: Path, grayscale: bool) -> np.ndarray:
@@ -182,6 +196,7 @@ def main() -> None:
     print(f"- Loaded templates: {', '.join(name for name, _ in templates)}")
     print("- Move mouse to top-left corner to trigger PyAutoGUI failsafe")
     print("- Press q in this terminal window to stop")
+    print("- Press r in this terminal window to restart sequence from template 1")
     print("- Starting in 3 seconds...")
     time.sleep(3)
 
@@ -190,9 +205,12 @@ def main() -> None:
     sequence_index = 0
 
     while True:
-        if maybe_quit():
+        stop_requested, reset_requested = handle_keyboard_input(templates)
+        if stop_requested:
             print(f"[{now()}] Stop requested (q pressed).")
             break
+        if reset_requested:
+            sequence_index = 0
 
         frame = screenshot_to_cv(args.region, args.grayscale)
 
@@ -227,6 +245,9 @@ def main() -> None:
                     print(f"[{now()}] Clicked {tpl_name}")
                     if use_sequence_mode:
                         sequence_index = (sequence_index + 1) % len(templates)
+                        if sequence_index == 0:
+                            print(f"[{now()}] Loop completed! Waiting {args.loop_delay:.1f}s before restarting...")
+                            time.sleep(args.loop_delay)
                         next_name = templates[sequence_index][0]
                         print(f"[{now()}] Next template: {next_name}")
 
