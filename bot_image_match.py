@@ -1,9 +1,13 @@
 import argparse
 import datetime as dt
 import random
+import sys
+import threading
 import time
+import tkinter as tk
 from pathlib import Path
-from typing import List, Tuple
+from tkinter import messagebox, ttk
+from typing import Callable, List, Optional, Tuple
 
 import cv2
 import msvcrt
@@ -75,8 +79,8 @@ def parse_args() -> argparse.Namespace:
         "--fallback-timeout",
         nargs="+",
         type=float,
-        default=[1.8, 2.5],
-        help="Time (seconds) to wait before falling back. Single value or MIN MAX range. Default: 1.8 2.5",
+        default=[0.8, 1.5],
+        help="Time (seconds) to wait before falling back. Single value or MIN MAX range. Default: 0.8 1.5",
     )
     parser.add_argument(
         "--region",
@@ -154,6 +158,8 @@ def resolve_template_paths(args: argparse.Namespace) -> List[Path]:
 
         for index in range(start, end + 1):
             paths.append((template_dir / f"{index}{ext}").resolve())
+            if getattr(args, "insert_nine_after_five", False) and index == 5:
+                paths.append((template_dir / f"9{ext}").resolve())
 
     if not paths:
         raise ValueError("Provide --template, --templates, or --numbered")
@@ -216,9 +222,11 @@ def do_click(x: int, y: int) -> None:
         pyautogui.click(x, y)
 
 
-def main() -> None:
-    args = parse_args()
-
+def run_bot(
+    args: argparse.Namespace,
+    stop_event: Optional[threading.Event] = None,
+    status_callback: Optional[Callable[[str], None]] = None,
+) -> None:
     if not 0.0 <= args.threshold <= 1.0:
         raise ValueError("--threshold must be in range [0.0, 1.0]")
 
@@ -231,10 +239,15 @@ def main() -> None:
     print("Image bot started")
     print(f"- Loaded templates: {', '.join(name for name, _ in templates)}")
     print("- Move mouse to top-left corner to trigger PyAutoGUI failsafe")
-    print("- Press q in this terminal window to stop")
+    print("- Press q in this terminal window or use the GUI Stop button to stop")
     print("- Press r in this terminal window to restart sequence from template 1")
     print("- Starting in 3 seconds...")
-    time.sleep(3)
+    if status_callback:
+        status_callback("Status: starting...")
+    if stop_event and stop_event.wait(3):
+        return
+    if not stop_event:
+        time.sleep(3)
 
     last_click_ts = 0.0
     use_sequence_mode = args.numbered is not None
@@ -245,6 +258,9 @@ def main() -> None:
     current_fallback_timeout = get_random_value(args.fallback_timeout)
 
     while True:
+        if stop_event and stop_event.is_set():
+            print(f"[{now()}] Stop requested from GUI.")
+            break
         stop_requested, reset_requested = handle_keyboard_input(templates)
         if stop_requested:
             print(f"[{now()}] Stop requested (q pressed).")
@@ -264,8 +280,13 @@ def main() -> None:
         if use_sequence_mode:
             check_index = (sequence_index - 1) % len(templates) if is_fallback else sequence_index
             templates_to_check = [templates[check_index]]
+            search_label = "Fallback: searching" if is_fallback else "Searching"
+            if status_callback:
+                status_callback(f"{search_label} image: {templates[check_index][0]}")
         else:
             templates_to_check = templates
+            if status_callback:
+                status_callback("Searching configured images")
 
         for tpl_name, tpl_img in templates_to_check:
             score, top_left = find_template(frame, tpl_img)
@@ -298,7 +319,10 @@ def main() -> None:
                             if sequence_index == 0:
                                 delay = get_random_value(args.loop_delay)
                                 print(f"[{now()}] Loop completed! Waiting {delay:.2f}s before restarting...")
-                                time.sleep(delay)
+                                if stop_event and stop_event.wait(delay):
+                                    break
+                                if not stop_event:
+                                    time.sleep(delay)
                             next_name = templates[sequence_index][0]
                             print(f"[{now()}] Next template: {next_name}")
                         search_start_ts = time.time()
@@ -340,12 +364,135 @@ def main() -> None:
             if args.once:
                 break
 
-        time.sleep(get_random_value(args.interval))
+        delay = get_random_value(args.interval)
+        if stop_event and stop_event.wait(delay):
+            break
+        if not stop_event:
+            time.sleep(delay)
+
+
+class BotGui:
+    def __init__(self) -> None:
+        self.root = tk.Tk()
+        self.root.title("CookieBot")
+        self.root.resizable(False, False)
+        self.stop_event: Optional[threading.Event] = None
+        self.worker: Optional[threading.Thread] = None
+
+        frame = ttk.Frame(self.root, padding=16)
+        frame.grid(sticky="nsew")
+
+        self.template_dir = tk.StringVar(value=".")
+        self.start = tk.StringVar(value="1")
+        self.end = tk.StringVar(value="8")
+        self.threshold = tk.StringVar(value="0.9")
+        self.interval = tk.StringVar(value="0.6")
+        self.cooldown = tk.StringVar(value="1.2")
+        self.insert_nine_after_five = tk.BooleanVar(value=False)
+        self.status = tk.StringVar(value="Status: stopped")
+
+        fields = [
+            ("Template folder", self.template_dir),
+            ("Start number", self.start),
+            ("End number", self.end),
+            ("Threshold", self.threshold),
+            ("Interval (seconds)", self.interval),
+            ("Cooldown (seconds)", self.cooldown),
+        ]
+        for row, (label, value) in enumerate(fields):
+            ttk.Label(frame, text=label).grid(row=row, column=0, padx=(0, 12), pady=4, sticky="w")
+            ttk.Entry(frame, textvariable=value, width=28).grid(row=row, column=1, pady=4, sticky="ew")
+
+        ttk.Checkbutton(
+            frame,
+            text="Insert image 9 between 5 and 6",
+            variable=self.insert_nine_after_five,
+        ).grid(row=len(fields), column=0, columnspan=2, pady=(8, 0), sticky="w")
+        self.start_button = ttk.Button(frame, text="Start", command=self.start_bot)
+        self.start_button.grid(row=len(fields) + 1, column=0, pady=(12, 0), sticky="ew")
+        self.stop_button = ttk.Button(frame, text="Stop", command=self.stop_bot, state="disabled")
+        self.stop_button.grid(row=len(fields) + 1, column=1, pady=(12, 0), sticky="ew")
+        ttk.Label(frame, textvariable=self.status).grid(
+            row=len(fields) + 2, column=0, columnspan=2, pady=(12, 0), sticky="w"
+        )
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+
+    def start_bot(self) -> None:
+        try:
+            args = argparse.Namespace(
+                template=None,
+                templates=None,
+                numbered=(int(self.start.get()), int(self.end.get())),
+                insert_nine_after_five=self.insert_nine_after_five.get(),
+                template_dir=self.template_dir.get(),
+                template_ext=".png",
+                threshold=float(self.threshold.get()),
+                interval=[float(self.interval.get())],
+                cooldown=[float(self.cooldown.get())],
+                loop_delay=[2.0, 6.0],
+                fallback_timeout=[0.8, 1.5],
+                region=None,
+                grayscale=True,
+                once=False,
+                dry_run=False,
+            )
+            if args.numbered[0] > args.numbered[1]:
+                raise ValueError("Start number must not be greater than end number")
+        except ValueError as error:
+            messagebox.showerror("Invalid settings", str(error), parent=self.root)
+            return
+
+        self.stop_event = threading.Event()
+        self.worker = threading.Thread(target=self.run_worker, args=(args,), daemon=True)
+        self.worker.start()
+        self.start_button.configure(state="disabled")
+        self.stop_button.configure(state="normal")
+        self.status.set("Status: running")
+
+    def run_worker(self, args: argparse.Namespace) -> None:
+        try:
+            run_bot(args, self.stop_event, self.update_status)
+        except (FileNotFoundError, ValueError, pyautogui.FailSafeException) as error:
+            self.root.after(
+                0, lambda error=error: messagebox.showerror("Bot error", str(error), parent=self.root)
+            )
+        finally:
+            self.root.after(0, self.finished)
+
+    def update_status(self, message: str) -> None:
+        self.root.after(0, lambda: self.status.set(message))
+
+    def stop_bot(self) -> None:
+        if self.stop_event:
+            self.stop_event.set()
+            self.status.set("Status: stopping...")
+            self.stop_button.configure(state="disabled")
+
+    def finished(self) -> None:
+        self.stop_event = None
+        self.worker = None
+        self.start_button.configure(state="normal")
+        self.stop_button.configure(state="disabled")
+        self.status.set("Status: stopped")
+
+    def close(self) -> None:
+        self.stop_bot()
+        self.root.destroy()
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+
+def main() -> None:
+    run_bot(parse_args())
 
 
 if __name__ == "__main__":
     try:
-        main()
+        if len(sys.argv) > 1:
+            main()
+        else:
+            BotGui().run()
     except pyautogui.FailSafeException:
         print("Failsafe triggered. Exiting.")
     except KeyboardInterrupt:
